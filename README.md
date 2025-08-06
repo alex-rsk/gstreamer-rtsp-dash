@@ -7,7 +7,7 @@ mkdir src
 ```
 
 #### Build
-# Generate build system
+#### Generate build system
 autoreconf -fiv
 ## if you've GNOME autoconf:
 #./autogen.sh
