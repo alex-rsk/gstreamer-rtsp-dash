@@ -1,4 +1,4 @@
-#### Setup
+### Setup
 
 ```
 mkdir rtsp-dash-streamer
@@ -6,7 +6,7 @@ cd rtsp-dash-streamer
 mkdir src
 ```
 
-#### Build
+### Build
 #### Generate build system
 autoreconf -fiv
 #### if you've GNOME autoconf:
