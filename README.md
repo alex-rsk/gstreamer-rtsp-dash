@@ -1,4 +1,4 @@
-### Setup
+#### Setup
 
 ```
 mkdir rtsp-dash-streamer
@@ -6,23 +6,23 @@ cd rtsp-dash-streamer
 mkdir src
 ```
 
-## Build
+#### Build
 # Generate build system
 autoreconf -fiv
 ## if you've GNOME autoconf:
 #./autogen.sh
 
-# Configure the build
+#### Configure the build
 ./configure
 
-# Compile
+#### Compile
 make
 
-# The binary will be in src/rtsp-dash-streamer
+#### The binary will be in src/rtsp-dash-streamer
 
-## Usage
+### Usage
 
-# Create output directory for DASH manifests
+#### Create output directory for DASH manifests
 mkdir -p /tmp/dash-output
 
 ./src/rtsp-dash-streamer rtsp://your.camera.ip:554/stream /tmp/dash-output
