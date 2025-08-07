@@ -160,7 +160,7 @@ private:
         GstElement *videoscale = gst_element_factory_make("videoscale", scale_name.c_str());
         GstElement *videorate = gst_element_factory_make("videorate", rate_name.c_str());
         GstElement *capsfilter = gst_element_factory_make("capsfilter", NULL);
-        GstElement *encoder = gst_element_factory_make("x264enc", enc_name.c_str());
+        GstElement *encoder = gst_element_factory_make("openh264enc", enc_name.c_str());
         GstElement *h264parse = gst_element_factory_make("h264parse", parse_name.c_str());
         GstElement *dash_sink = gst_element_factory_make("dashsink", sink_name.c_str());
         
@@ -182,8 +182,8 @@ private:
         // Configure encoder
         g_object_set(encoder,
             "bitrate", bitrate,
-            "speed-preset", 2, // Fast preset
-            "tune", 4, // Zero latency
+//            "speed-preset", 2, // Fast preset
+//            "tune", 4, // Zero latency
             NULL);
         
         // Configure DASH sink
