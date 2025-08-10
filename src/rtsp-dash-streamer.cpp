@@ -19,6 +19,7 @@ private:
     std::string rtsp_uri;
     std::string output_path;
     bool is_rtsp_connected;
+    bool tee_linked;
     
 public:
     RTSPDashStreamer(const std::string& uri, const std::string& output) 
@@ -26,14 +27,14 @@ public:
           input_selector(nullptr), tee(nullptr), dash_sink_fullhd(nullptr),
           dash_sink_hd(nullptr), bus(nullptr), loop(nullptr),
           bus_watch_id(0), reconnect_timeout_id(0),
-          rtsp_uri(uri), output_path(output), is_rtsp_connected(false) {}
+          rtsp_uri(uri), output_path(output), is_rtsp_connected(false), tee_linked(false) {}
     
     ~RTSPDashStreamer() {
         cleanup();
     }
     
     bool initialize() {
-        // Create main pipeline
+        std::cout << "Initialize" << std::endl;
         pipeline = gst_pipeline_new("rtsp-dash-pipeline");
         if (!pipeline) {
             g_printerr("Failed to create pipeline\n");
@@ -51,9 +52,11 @@ public:
         g_object_set(rtsp_src,
             "location", rtsp_uri.c_str(),
             "retry", 999,
+            "protocols", 4,
             "timeout", G_GUINT64_CONSTANT(5000000), // 5 seconds
             "tcp-timeout", G_GUINT64_CONSTANT(5000000),
             "do-retransmission", TRUE,
+            "drop-on-latency", TRUE, 
             "latency", 200, // 200ms latency
             NULL);
         
@@ -62,11 +65,11 @@ public:
         if (!dummy_src) {
             g_printerr("Failed to create videotestsrc element\n");
             return false;
-        }
+        }        
         
         // Configure dummy source
         g_object_set(dummy_src,
-            "pattern", 2, // Black screen
+            "pattern", 18,
             "is-live", TRUE,
             NULL);
         
@@ -84,19 +87,24 @@ public:
             return false;
         }
         
-        // Create DASH sinks
-        if (!create_dash_pipeline("fullhd", 1920, 1080, 5000) ||
-            !create_dash_pipeline("hd", 1280, 720, 3000)) {
+        // Add core elements to pipeline first
+        gst_bin_add_many(GST_BIN(pipeline), 
+            rtsp_src, dummy_src, input_selector, tee, NULL);
+        
+        // Connect dummy source to input selector first
+        if (!connect_dummy_source()) {
             return false;
         }
         
-        // Add elements to pipeline
-        gst_bin_add_many(GST_BIN(pipeline), 
-            rtsp_src, dummy_src, input_selector, tee,
-            dash_sink_fullhd, dash_sink_hd, NULL);
+        // Link input selector to tee BEFORE creating DASH pipelines
+        if (!gst_element_link(input_selector, tee)) {
+            g_printerr("Failed to link input selector to tee\n");
+            return false;
+        }
         
-        // Connect dummy source to input selector
-        if (!connect_dummy_source()) {
+        // Now create DASH pipelines - tee is ready to provide source pads
+        if (!create_dash_pipeline("fullhd", 1920, 1080, 5000) ||
+            !create_dash_pipeline("hd", 1280, 720, 3000)) {
             return false;
         }
         
@@ -172,6 +180,7 @@ private:
         
         // Configure caps for resolution and framerate
         GstCaps *caps = gst_caps_new_simple("video/x-raw",
+            "format", G_TYPE_STRING, "I420",
             "width", G_TYPE_INT, width,
             "height", G_TYPE_INT, height,
             "framerate", GST_TYPE_FRACTION, 25, 1,
@@ -182,38 +191,66 @@ private:
         // Configure encoder
         g_object_set(encoder,
             "bitrate", bitrate,
-//            "speed-preset", 2, // Fast preset
-//            "tune", 4, // Zero latency
-            NULL);
+        NULL);
         
         // Configure DASH sink
-        std::string manifest_path = output_path + "/" + quality + "_manifest.mpd";
+        std::string manifest_path = "./manifest.mpd";
+        
         g_object_set(dash_sink,
             "mpd-filename", manifest_path.c_str(),
-            "target-duration", 4, // 4 second segments
-            NULL);
-        
+            "muxer", 0,
+            "target-duration", 4, // 4 second segments        
+            "use-segment-list", TRUE,
+            "mpd-baseurl" , "./",
+            "mpd-root-path", output_path.c_str(),        
+            "send-keyframe-requests", TRUE,
+        NULL);
+
         // Add elements to pipeline
         gst_bin_add_many(GST_BIN(pipeline),
             queue, videoconvert, videoscale, videorate, 
-            capsfilter, encoder, h264parse, dash_sink, NULL);
-        
-        // Link elements
+            capsfilter, encoder, h264parse, dash_sink, NULL);                
+
+        // Link elements in the encoding chain
         if (!gst_element_link_many(queue, videoconvert, videoscale, 
                                    videorate, capsfilter, encoder, 
                                    h264parse, dash_sink, NULL)) {
             g_printerr("Failed to link %s pipeline elements\n", quality.c_str());
             return false;
         }
-        
+
         // Request tee pad and link to queue
         GstPad *tee_pad = gst_element_get_request_pad(tee, "src_%u");
+        if (!tee_pad) {
+            g_printerr("Failed to get tee source pad for %s\n", quality.c_str());
+            return false;
+        }
+        
         GstPad *queue_pad = gst_element_get_static_pad(queue, "sink");
+        if (!queue_pad) {
+            g_printerr("Failed to get queue sink pad for %s\n", quality.c_str());
+            gst_object_unref(tee_pad);
+            return false;
+        }
+        
+        // Sync state of new elements with pipeline
+        gst_element_sync_state_with_parent(queue);
+        gst_element_sync_state_with_parent(videoconvert);
+        gst_element_sync_state_with_parent(videoscale);
+        gst_element_sync_state_with_parent(videorate);
+        gst_element_sync_state_with_parent(capsfilter);
+        gst_element_sync_state_with_parent(encoder);
+        gst_element_sync_state_with_parent(h264parse);
+        gst_element_sync_state_with_parent(dash_sink);
         
         if (gst_pad_link(tee_pad, queue_pad) != GST_PAD_LINK_OK) {
             g_printerr("Failed to link tee to %s queue\n", quality.c_str());
+            gst_object_unref(tee_pad);
+            gst_object_unref(queue_pad);
             return false;
         }
+        
+        g_print("Successfully linked tee to %s queue\n", quality.c_str());
         
         gst_object_unref(tee_pad);
         gst_object_unref(queue_pad);
@@ -230,16 +267,17 @@ private:
     
     bool connect_dummy_source() {
         // Create caps filter for dummy source
-        GstElement *dummy_caps = gst_element_factory_make("capsfilter", "dummy-caps");
         GstElement *dummy_convert = gst_element_factory_make("videoconvert", "dummy-convert");
+        GstElement *dummy_caps = gst_element_factory_make("capsfilter", "dummy-caps");
         
         if (!dummy_caps || !dummy_convert) {
             g_printerr("Failed to create dummy source elements\n");
             return false;
         }
         
-        // Set caps for dummy source
+        // Set caps for dummy source to match expected format
         GstCaps *caps = gst_caps_new_simple("video/x-raw",
+            "format", G_TYPE_STRING, "I420",
             "width", G_TYPE_INT, 1920,
             "height", G_TYPE_INT, 1080,
             "framerate", GST_TYPE_FRACTION, 25, 1,
@@ -247,20 +285,21 @@ private:
         g_object_set(dummy_caps, "caps", caps, NULL);
         gst_caps_unref(caps);
         
-        gst_bin_add_many(GST_BIN(pipeline), dummy_caps, dummy_convert, NULL);
+        gst_bin_add_many(GST_BIN(pipeline), dummy_convert, dummy_caps, NULL);
         
         // Link dummy source chain
-        if (!gst_element_link_many(dummy_src, dummy_caps, dummy_convert, NULL)) {
+        if (!gst_element_link_many(dummy_src, dummy_convert, dummy_caps, NULL)) {
             g_printerr("Failed to link dummy source elements\n");
             return false;
         }
         
         // Connect to input selector
-        GstPad *dummy_pad = gst_element_get_static_pad(dummy_convert, "src");
+        GstPad *dummy_pad = gst_element_get_static_pad(dummy_caps, "src");
         GstPad *selector_pad = gst_element_get_request_pad(input_selector, "sink_%u");
         
         if (gst_pad_link(dummy_pad, selector_pad) != GST_PAD_LINK_OK) {
             g_printerr("Failed to link dummy source to input selector\n");
+            gst_object_unref(dummy_pad);
             return false;
         }
         
@@ -268,7 +307,6 @@ private:
         g_object_set_data(G_OBJECT(input_selector), "dummy-pad", selector_pad);
         
         gst_object_unref(dummy_pad);
-        // Don't unref selector_pad, we need it later
         
         return true;
     }
@@ -362,7 +400,7 @@ private:
             if (g_str_has_prefix(name, "application/x-rtp") && 
                 gst_structure_has_field(structure, "media")) {
                 const gchar *media = gst_structure_get_string(structure, "media");
-                
+                std::cout << "Media: " << media << std::endl;
                 if (g_strcmp0(media, "video") == 0) {
                     // Create RTP depayloader and decoder chain
                     create_rtsp_decode_chain(pad);
@@ -379,16 +417,27 @@ private:
         GstElement *parse = gst_element_factory_make("h264parse", "rtsp-parse");
         GstElement *decode = gst_element_factory_make("avdec_h264", "rtsp-decode");
         GstElement *convert = gst_element_factory_make("videoconvert", "rtsp-convert");
+        GstElement *rtsp_caps = gst_element_factory_make("capsfilter", "rtsp-caps");
         
-        if (!depay || !parse || !decode || !convert) {
+        if (!depay || !parse || !decode || !convert || !rtsp_caps) {
             g_printerr("Failed to create RTSP decode chain elements\n");
             return;
         }
         
-        gst_bin_add_many(GST_BIN(pipeline), depay, parse, decode, convert, NULL);
+        // Set caps for RTSP output to match dummy source format
+        GstCaps *caps = gst_caps_new_simple("video/x-raw",
+            "format", G_TYPE_STRING, "I420",
+            "width", G_TYPE_INT, 1920,
+            "height", G_TYPE_INT, 1080,
+            "framerate", GST_TYPE_FRACTION, 25, 1,
+            NULL);
+        g_object_set(rtsp_caps, "caps", caps, NULL);
+        gst_caps_unref(caps);
+        
+        gst_bin_add_many(GST_BIN(pipeline), depay, parse, decode, convert, rtsp_caps, NULL);
         
         // Link decode chain
-        if (!gst_element_link_many(depay, parse, decode, convert, NULL)) {
+        if (!gst_element_link_many(depay, parse, decode, convert, rtsp_caps, NULL)) {
             g_printerr("Failed to link RTSP decode chain\n");
             return;
         }
@@ -401,7 +450,7 @@ private:
         gst_object_unref(depay_sink);
         
         // Connect convert output to input selector
-        GstPad *convert_src = gst_element_get_static_pad(convert, "src");
+        GstPad *convert_src = gst_element_get_static_pad(rtsp_caps, "src");
         GstPad *selector_pad = gst_element_get_request_pad(input_selector, "sink_%u");
         
         if (gst_pad_link(convert_src, selector_pad) != GST_PAD_LINK_OK) {
@@ -412,18 +461,30 @@ private:
         g_object_set_data(G_OBJECT(input_selector), "rtsp-pad", selector_pad);
         
         gst_object_unref(convert_src);
-        // Don't unref selector_pad, we need it later
         
         // Sync states
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decode);
         gst_element_sync_state_with_parent(convert);
+        gst_element_sync_state_with_parent(rtsp_caps);
         
-        // Link input selector to tee
-        if (!gst_element_link(input_selector, tee)) {
-            g_printerr("Failed to link input selector to tee\n");
+         // Wait for elements to reach PLAYING state
+        GstStateChangeReturn ret;
+        ret = gst_element_get_state(rtsp_caps, NULL, NULL, GST_CLOCK_TIME_NONE);
+        if (ret == GST_STATE_CHANGE_SUCCESS) {
+            g_print("RTSP decode chain ready, switching input\n");
+            // Now it's safe to switch
+            g_timeout_add_seconds(1, switch_to_rtsp_delayed, this);
         }
+        g_print("RTSP decode chain created and linked\n");
+    }
+
+
+    static gboolean switch_to_rtsp_delayed(gpointer user_data) {
+        RTSPDashStreamer *streamer = static_cast<RTSPDashStreamer*>(user_data);
+        streamer->switch_to_rtsp_source();
+        return FALSE;
     }
     
     void switch_to_dummy_source() {
